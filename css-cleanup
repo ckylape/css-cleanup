@@ -1,0 +1,245 @@
+#!/usr/bin/env node
+
+const program = require('commander')
+const colors = require('colors')
+const purifyCss = require('purify-css')
+const got = require('got')
+const cheerio = require('cheerio')
+const uparse = require('url')
+const path = require('path')
+const fs = require('fs-extra')
+const moment = require('moment')
+const {default: PQueue} = require('p-queue')
+const os = require('os')
+
+program
+  .version('0.1.0', '-v, --version')
+  .option('-u, --url <url>', 'sitemap.xml URL')
+  .option('-w, --whitelist <pattern>', 'the pattern to follow for CSS files')
+
+program.parse(process.argv)
+
+const now = 1560173016 // moment().unix()
+const dir = path.join(__dirname, 'output', now.toString())
+const queue = new PQueue({ concurrency: os.cpus().length })
+const url = program.url
+const whitelist = program.whitelist
+
+if (!url) {
+  console.error(colors.red('Invalid command:\nSee --help for a list of available commands.'))
+  process.exit(1)
+} else {
+  const check = uparse.parse(url)
+  if (!check.hostname) {
+    console.error(colors.red('Invalid/Bad URL:\nSee --help for a list of available commands.'))
+    process.exit(1)
+  }
+}
+
+main(url, whitelist)
+
+async function main(url, pattern) {
+  let whitelists = ['*']
+
+  if (pattern) {
+    whitelists = []
+    for (const p of pattern.split(',')) {
+      whitelists.push(new RegExp('^' + p))
+    }
+  }
+
+  try {
+    const urls = await sitemap(url)
+    for (const u of urls) {
+      //queue.add(() => scan(u, whitelists))
+    }
+
+    await queue.onIdle()
+
+    await purify()
+
+    console.log(colors.green(`Success:\nSee the report at "${path.join(dir, 'report.txt')}".`))
+  } catch (error) {
+    console.error(colors.red('Error:\nSee --help for a list of available commands.'))
+    process.exit(1)
+  }
+}
+
+async function save(url, data) {
+  try {
+    let pathname = uparse.parse(url).pathname
+
+    pathname = pathname.replace(/\/$/, '')
+    if (pathname === '') {
+      pathname = 'index.html'
+    } else {
+      pathname += '.html'
+    }
+
+    const file = path.join(dir, 'html', pathname)
+
+    fs.ensureFile(file, err => {
+      if (err) console.error(err)
+      fs.appendFile(file, data, err => {
+        if (err) console.error(err)
+      })
+    })
+
+  } catch (error) {
+    console.error(error)
+  }
+}
+
+async function scan(url, whitelists = ['*']) {
+  try {
+    const request = await got.get(url)
+
+    // convert to cheerio object
+    const $ = await cheerio.load(request.body)
+
+    // extract all the CSS
+    await $('link[rel="stylesheet"]').each(async (i, link) => {
+      let href = $(link).attr('href')
+      if (href) {
+        const origin = uparse.parse(url)
+        let parsed = uparse.parse(href)
+        if (parsed.host === null && href.startsWith('//')) {
+          href = origin.protocol + href
+          parsed = uparse.parse(href)
+        }
+        if (parsed.host === null && href.startsWith('/')) {
+          parsed = uparse.parse(`${origin.protocol}//${origin.host}${href}`)
+        }
+
+        let found = null
+        for (const pattern of whitelists) {
+          if (parsed.pathname.match(pattern)) {
+            found = parsed.pathname
+          }
+        }
+
+        // add newly found link to queue
+        if (found) {
+          // check if css file exists
+          const file = path.join(dir, 'css', found)
+          fs.pathExists(file, (err, exists) => {
+            if (!exists) {
+              fs.ensureFile(file, err => {
+                if (err) console.error(err)
+                got.stream(parsed.href).pipe(fs.createWriteStream(file))
+              })
+            }
+          })
+        }
+      }
+    })
+
+    save(url, request.body)
+
+    return true
+  } catch (error) {
+    return false
+  }
+}
+
+async function sitemap(url, extracted = []) {
+  const request = await got.get(url)
+  const $ = await cheerio.load(request.body, { xmlMode: true })
+
+  const indexes = await $('sitemap loc').map((i, elem) => {
+    return $(elem).text()
+  }).get()
+
+  // cheerio doesn't support async each (yet...)
+  for (const i of indexes) {
+    await sitemap(i, extracted)
+  }
+
+  await $('url loc').each((i, elem) => {
+    extracted.push($(elem).text())
+  })
+
+	return extracted
+}
+
+async function walk(dir, fileList = []) {
+  const files = await fs.readdir(dir)
+  for (const file of files) {
+    const stat = await fs.stat(path.join(dir, file))
+    if (stat.isDirectory()) {
+      fileList = await walk(path.join(dir, file), fileList)
+    }
+    else {
+      if (path.extname(file) === '.html') {
+        fileList.push(path.join(dir, file))
+      }
+    }
+  }
+  return fileList
+}
+
+function chunk(array, size = 500) {
+  if (!array) return []
+  const firstChunk = array.slice(0, size)
+  if (!firstChunk.length) {
+    return array
+  }
+  return [firstChunk].concat(chunk(array.slice(size, array.length), size))
+}
+
+async function purify() {
+  let rejected = []
+  let temp = []
+
+  // Need to overwrite console.log because purify-css doesn't extract rejected
+  const reset = console.log
+  console.log = (d) => {
+    const arr = d.split('\n')
+    for (const [index, element] of arr.entries()) {
+      if (index > 3 && index < (arr.length - 3)) {
+        const selector = element.replace(/^\s+\|\s+/, '')
+        if (selector.length > 1) {
+          temp.push(selector)
+        }
+      }
+    }
+  }
+
+  // Grab all the CSS files
+  const css = [
+    path.join(dir, 'css/**/*.css')
+  ]
+
+  // Chunk the results into a smaller subset of arrays
+  const files = await walk(dir)
+  const chunked = chunk(files)
+  const total = chunked.length
+  for (const html of chunked) {
+    await purifyCss(html, css, { rejected: true })
+    rejected = rejected.concat([...new Set(temp)])
+    // reset the temp file since files may have duplicate selectors
+    temp = []
+  }
+
+  // Reset console.log back to normal
+  console.log = reset
+
+  // Reduce the rejected selectors and count them
+  const unique = rejected.reduce((acc, val) => {
+    acc[val] = acc[val] === undefined ? 1 : acc[val] += 1;
+    return acc;
+  }, {})
+
+  // Prepare output file
+  let ws = fs.createWriteStream(path.join(dir, 'report.txt'))
+
+  // if the count isnt the chunk size, it can be assumed it can be removed
+  for (let [selector, count] of Object.entries(unique)) {
+    if (count >= total) {
+      ws.write(selector + '\n')
+    }
+  }
+
+  // Close output stream
+  await ws.end()
+}
