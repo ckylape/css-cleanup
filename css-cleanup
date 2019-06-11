@@ -19,7 +19,7 @@ program
 
 program.parse(process.argv)
 
-const now = 1560173016 // moment().unix()
+const now = moment().unix()
 const dir = path.join(__dirname, 'output', now.toString())
 const queue = new PQueue({ concurrency: os.cpus().length })
 const url = program.url
@@ -51,7 +51,7 @@ async function main(url, pattern) {
   try {
     const urls = await sitemap(url)
     for (const u of urls) {
-      //queue.add(() => scan(u, whitelists))
+      queue.add(() => scan(u, whitelists))
     }
 
     await queue.onIdle()
