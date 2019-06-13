@@ -39,7 +39,7 @@ if (!url) {
 main(url, whitelist)
 
 async function main(url, pattern) {
-  let whitelists = ['*']
+  let whitelists = ['.*']
 
   if (pattern) {
     whitelists = []
